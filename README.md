@@ -1,86 +1,68 @@
-# Centralized traffic filtering using AWS Network Firewall
+## Network 환경
 
-This is the repository for the official tecRacer blog post [Centralized traffic filtering using AWS Network Firewall](https://www.tecracer.com/blog/2023/11/centralized-traffic-filtering-using-aws-network-firewall.html).
+https://www.tecracer.com/blog/2023/11/centralized-traffic-filtering-using-aws-network-firewall.html
 
-## Architecture
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/89712d40-f9f4-4891-b608-fe549e023fbf/d9a797bb-2b9f-4264-906a-07fb4a4c7e01/image.png)
 
-I would like to start by introducing the infrastructure that we are going to deploy as part of this blog post. The architecture diagram below provides a high-level snapshot of the components and workflow we are about to implement. Our objective is to build a Hybrid Hub and Spoke Network topology including a centralized AWS Network Firewall to conduct comprehensive network traffic analysis and filtering.
+![centralized-network-filtering-network-firewall-traffic-flow.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/89712d40-f9f4-4891-b608-fe549e023fbf/421853a8-86a4-4137-9424-61686f62f9b5/centralized-network-filtering-network-firewall-traffic-flow.png)
 
-![High Level Design](media/high-level.png)
+구축 과정
 
-The Hub and Spoke network is designed with four Virtual Private Clouds (VPCs) interconnected through a Transit Gateway. The primary VPC, referred to as the `Workload` VPC, serves as the home for our enterprise workload. In this example, an Apache web server is deployed, accessible both from the On-Premises network and the Internet. Two additional VPCs, namely `Central Ingress` and `Central Egress`, are established to segregate incoming and outgoing traffic.
+1. AWS CLI, terraform 설치
+2. `aws configure`
+    1. IAM secret key pub key 입력
+    2. region:  `us-east-1a`로 수정
+3. 테라폼 파일 값 수정
+    1. `terraform.tfvars`
+        1. us-east-1a 1b 로 수정
+        2. Private VPC Subnet 수정
+4. AWS Service Quota 늘리기
+    1. VPC max num 5 -> 20
+    2. EC2 EIP 5 -> 20
+5. `terraform init,` `terraform plan`, `terraform apply`
+6. 끝나고 무조건 `terraform destory`!!!
 
-Within the `Central Ingress` VPC, an `Application Load Balancer` is configured to forward incoming requests from the Internet to the web server hosted in the `Workload` VPC. The `Central Egress` VPC allows the connectivity of the EC2 instance within the `Workload` VPC to the Internet, enabling the download of necessary packages and software.
+### Problem 1. On-premise ↔ Spoke VPC A 연결 불가 해결
 
-To ensure comprehensive security, all traffic, including communication between different entities and in all directions, is monitored by the `AWS Network Firewall`. This security infrastructure is implemented within the `Inspection` VPC.
+---
 
-Additionally, an `On-Premises` location, housing clients seeking access to the web server through the private network, is integrated into the Hub and Spoke network via an `AWS Site-to-Site VPN` connection. For the purposes of this illustration, the On-Premises VPN connection will be configured and emulated using an AWS Virtual Private Cloud (VPC) in tandem with an EC2 instance operating `StrongSwan`. The traffic between the web server and the On-Premises clients is also routed through the `Inspection` VPC, allowing for continuous monitoring and filtering of data.
+현 상황: On-premise에서 Spoke VPC A (Workload VPC) 연결 불가
 
-Below is an enhanced depiction of the architecture, presenting a more detailed diagram featuring the specific components to be deployed, along with Subnet and Transit Gateway routing tables for comprehensive understanding.
+문제:
 
-![Architecture](media/architecture.png)
+**On-premise에서 “client”라는 이름의 EC2 Instance에서의 모든 접근을 허용하도록 Firewall Policy를 구성해보기.**
 
-## Traffic Flow
+(Terraform 변수로 해결말고 직접 Policy를 추가해보기)
 
-After having given a quick overview of the Hub and Spoke topology, we will make a deep dive into the different traffic flows that will be analysed as part of this example. The digramm below highlights the traffic flow permutations that we will encounter.
+### Problem 2. Spoke VPC B(WORKLOAD) 추가
 
-![Traffic Flow](media/traffic-flow.png)
+---
 
-We will encounter three distinct flows as part of the example. `North-South: VPC egress to Internet`, `North-South: On-Premises to VPC`, and `East-West: VPC to VPC`. 
+Spoke VPC B라는 워크로드를 생성해 Inspection VPC를 거치지 않고 자체적인 Firewall endpoint와 Policy를 가지게끔 구현
 
-### North-South: VPC egress to Internet
+**구현 조건** (사진은 10.2.0.0/16으로 되어있음 → 10.4.0.0이 맞음)
 
-1. Following the deployment of our infrastructure, the EC2 instance in the Workload VPC initiates the download of necessary packages and software essential for operating our Apache web server. The traffic exits the Workload VPC and is directed to the Transit Gateway. The subsequent forwarding of this traffic is determined by the associated Transit Gateway Route Table linked with the VPC attachment.
+![image.png](https://prod-files-secure.s3.us-west-2.amazonaws.com/89712d40-f9f4-4891-b608-fe549e023fbf/e3f5792a-34f8-4b75-815b-8da2c3bff82f/image.png)
 
-2. The outbound traffic flows to the Inspection VPC and, therefore, to the Network Firewall. This configuration enables thorough analysis and filtering of outgoing traffic. We have the flexibility to impose restrictions based on specific criteria, such as domain names. For instance, internet access can be limited only to hostnames provided by the Server Name Indication (SNI).
+1. 10.4.0.0/16 대역으로 생성
+2. Firewall Subnet : 10.4.16.0/28
+3. Public Subnet : 10.4.1.0/24
+    1. ALB or NLB to Private Subnet
+4. Private Subnet : 10.4.2.0/24
+5. TGW Subnet : 10.4.0.0/28
+    1. TGW Gateway ENI
+6. IGW
 
-3. Upon completion of the outgoing traffic analysis, if no filtering occurs as per the network firewall rules, the traffic is routed back to the Transit Gateway. The following forwarding of this traffic is once again determined by the Transit Gateway Route Table linked with the VPC attachment.
+→ Egress는 TGW를 통해 Egress VPC를 통해 나가게끔 구현
 
-4. Outbound traffic intended for the public Internet is directed to the Central Egress VPC. Within this VPC, the traffic is routed through a NAT Gateway, proceeding to an Internet Gateway, and finally reaching its destination in the public Internet. The return traffic follows the same route as the outbound traffic, allowing for analysis of traffic and comprehensive filtering of return traffic.
+→ Ingress는 자체 IGW를 통해 Firewall Subnet을 통해 Public Sub과 Private Subnet까지 연결시켜보기
 
-### North-South: On-Premises to VPC
+### IF YOU WANT MORE>>>
 
-1. Once the Apache web server is operational, clients within our On-Premises network can initiate access attempts to the web server. Traffic from the client is directed to the Transit Gateway through the AWS Site-to-Site VPN connection. The Transit Gateway VPN attachment is associated with a specific route table, which dictates the subsequent routing decisions.
+https://www.tecracer.com/blog/2023/08/hybrid-dns-resolution-using-route-53-endpoints.html
 
-2. The incoming traffic is directed to the Inspection VPC and the Network Firewall for thorough analysis and filtering based on the configured firewall settings. The AWS Network Firewall provides extensive flexibility, supporting both self-managed and AWS-managed firewall rules, allowing us to filter traffic based on a myriad of criteria.
+https://www.tecracer.com/blog/2023/08/multiple-site-to-site-vpn-connections-in-aws-hub-and-spoke-topology.html
 
-3. Following the analysis of incoming traffic, if no filtering occurs as dictated by the network firewall rules, the traffic is routed back to the Transit Gateway. The subsequent forwarding of this traffic is determined once again by the Transit Gateway Route Table linked with the associated VPC attachment.
+https://www.tecracer.com/blog/2023/06/build-a-site-to-site-ipsec-vpn-with-public-encryption-domain.html
 
-4. Incoming traffic destined for the web server is then routed to the Workload VPC and directed to the EC2 server hosting the web server. The return traffic follows the same route as the outbound traffic, enabling a detailed analysis of traffic and comprehensive filtering of return traffic.
-
-### East-West: VPC to VPC
-
-1. With the Apache web server operational, external clients on the Internet can initiate access attempts through an Application Load Balancer sitting in the Central Ingress VPC. This Load Balancer actively listens for incoming requests and forwards traffic to the web server. Given that the web server resides in a separate VPC, the traffic is initially routed through the Transit Gateway. The subsequent forwarding of this traffic is determined by the associated Transit Gateway Route Table linked with the VPC attachment.
-
-2. The incoming traffic is directed to the Inspection VPC and the Network Firewall for thorough analysis and filtering based on the configured firewall settings. The AWS Network Firewall provides extensive flexibility, supporting both self-managed and AWS-managed firewall rules, allowing us to filter traffic based on a myriad of criteria.
-
-3. Following the analysis of incoming traffic, if no filtering occurs as dictated by the network firewall rules, the traffic is routed back to the Transit Gateway. The subsequent forwarding of this traffic is determined once again by the Transit Gateway Route Table linked with the associated VPC attachment.
-
-4. Incoming traffic destined for the web server is then routed to the Workload VPC and directed to the EC2 server hosting the web server. The return traffic follows the same route as the outbound traffic, enabling a detailed analysis of traffic and comprehensive filtering of return traffic.
-
-## Try it yourself
-
-### Prerequisites
-
-- [Terraform](https://developer.hashicorp.com/terraform/downloads)
-- An AWS Account
-
-### Setup
-
-1. Clone the repository to your local machine.
-2. Navigate to the `network` folder.
-3. Initialize the Terraform environment by executing `terraform init`.
-4. Deploy the infrastructure using `terraform plan` followed by `terraform apply`.
-5. Access the deployed Apache web server from the public internet through the Application Load Balancer. Obtain the DNS name from the Terraform output `ingress_alb_dns_name`.
-6. Access the Apache web server from the on-premises network via the Network Load Balancer. Find the DNS name in the Terraform output `workload_nlb_dns_name`. Utilize AWS Session Manager to connect to the On-Premises client through the AWS Console.
-7. Remove the blockage of traffic from the On-Premises Network. Open the file `terraform.tfvars`, locate the variable `network_firewall_on_premises_action`, and change its value from `DROP` to `PASS`.
-8. Deploy the changes using `terraform plan` followed by `terraform apply`.
-9. Retry accessing the web server from the On-Premises client. It should now succeed.
-
-### Result
-
-In our Hybrid Hub and Spoke network, we will utilize AWS Network Firewall to efficiently analyze, monitor, and filter both incoming and outgoing network traffic across all entities involved.
-
-### Teardown
-
-Run `terraform destroy` to remove the infrastructure
+https://www.tecracer.com/blog/
