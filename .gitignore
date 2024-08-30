@@ -1,0 +1,5 @@
+aws/*
+network/.terraform
+network/.terraform/
+network/.terraform.lock.hcl
+network/crash.log
